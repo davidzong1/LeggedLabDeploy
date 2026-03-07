@@ -30,6 +30,7 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_ as LowCmdGo
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_ as LowStateGo
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_ as LowCmdHG
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_ as LowStateHG
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_ as SportState
 from unitree_sdk2py.utils.crc import CRC
 from unitree_sdk2py.utils.thread import RecurrentThread
 
@@ -41,7 +42,7 @@ from common.command_helper import (
 )
 from common.remote_controller import KeyMap, RemoteController
 from common.rotation_helper import get_gravity_orientation, transform_imu_data
-from config import Config
+from .config import Config
 
 
 class Controller:
@@ -54,7 +55,9 @@ class Controller:
         self.remote_controller = RemoteController()
 
         self.policy = torch.jit.load(config.policy_path).eval()
-        self.run_thread = RecurrentThread(interval=self.config.control_dt, target=self.run)  # 100Hz/50Hz
+        self.run_thread = RecurrentThread(
+            interval=self.config.control_dt, target=self.run
+        )  # 100Hz/50Hz
         self.publish_thread = RecurrentThread(interval=1 / 500, target=self.publish)
         self.cmd_lock = Lock()
 
@@ -63,7 +66,9 @@ class Controller:
         self.action = np.zeros(config.num_actions, dtype=np.float32)
 
         self.current_obs = np.zeros(config.num_obs, dtype=np.float32)
-        self.current_obs_history = np.zeros((config.history_length, config.num_obs), dtype=np.float32)
+        self.current_obs_history = np.zeros(
+            (config.history_length, config.num_obs), dtype=np.float32
+        )
 
         self.clip_min_command = np.array(
             [
@@ -95,8 +100,16 @@ class Controller:
             self.lowcmd_publisher_ = ChannelPublisher(config.lowcmd_topic, LowCmdHG)
             self.lowcmd_publisher_.Init()
 
-            self.lowstate_subscriber = ChannelSubscriber(config.lowstate_topic, LowStateHG)
+            self.lowstate_subscriber = ChannelSubscriber(
+                config.lowstate_topic, LowStateHG
+            )
             self.lowstate_subscriber.Init(self.LowStateHandler, 10)
+
+            self.sportstate_subscriber = ChannelSubscriber(
+                config.sportstate_topic, SportState
+            )
+            self.sportstate_subscriber.Init(self.SportStateHandler, 10)
+
         elif config.msg_type == "go":
             self.low_cmd = unitree_go_msg_dds__LowCmd_()
             self.low_state = unitree_go_msg_dds__LowState_()
@@ -104,12 +117,21 @@ class Controller:
             self.lowcmd_publisher_ = ChannelPublisher(config.lowcmd_topic, LowCmdGo)
             self.lowcmd_publisher_.Init()
 
-            self.lowstate_subscriber = ChannelSubscriber(config.lowstate_topic, LowStateGo)
+            self.lowstate_subscriber = ChannelSubscriber(
+                config.lowstate_topic, LowStateGo
+            )
             self.lowstate_subscriber.Init(self.LowStateHandler, 10)
+
+            self.sportstate_subscriber = ChannelSubscriber(
+                config.sportstate_topic, SportState
+            )
+            self.sportstate_subscriber.Init(self.SportStateHandler, 10)
+
         else:
             raise ValueError("Invalid msg_type")
 
         self.wait_for_low_state()
+        self.wait_for_sport_state()
 
         if config.msg_type == "hg":
             self.low_cmd = init_cmd_hg(self.low_cmd, self.mode_machine_, self.mode_pr_)
@@ -128,6 +150,9 @@ class Controller:
     def LowStateHandler(self, msg: LowStateHG):
         self.low_state = msg
         self.remote_controller.set(self.low_state.wireless_remote)
+
+    def SportStateHandler(self, msg: SportState):
+        self.sport_state = msg
 
     def publish(self):
         with self.cmd_lock:
@@ -149,6 +174,11 @@ class Controller:
             time.sleep(self.config.control_dt)
         self.mode_machine_ = self.low_state.mode_machine
         print("Successfully connected to the robot.")
+
+    def wait_for_sport_state(self):
+        while self.sport_state.body_height == 0:
+            time.sleep(self.config.control_dt)
+        print("Successfully received sport state.")
 
     def wait_for_start(self):
         print("Enter zero torque state.")
@@ -178,7 +208,9 @@ class Controller:
                 for j in range(dof_size):
                     motor_idx = dof_idx[j]
                     target_pos = self.config.default_joint_pos[j]
-                    self.low_cmd.motor_cmd[motor_idx].q = init_dof_pos[j] * (1 - alpha) + target_pos * alpha
+                    self.low_cmd.motor_cmd[motor_idx].q = (
+                        init_dof_pos[j] * (1 - alpha) + target_pos * alpha
+                    )
                     self.low_cmd.motor_cmd[motor_idx].dq = 0
                     self.low_cmd.motor_cmd[motor_idx].kp = self.config.kps[j]
                     self.low_cmd.motor_cmd[motor_idx].kd = self.config.kds[j]
@@ -195,8 +227,12 @@ class Controller:
 
     def run(self):
         for i in range(len(self.config.joint2motor_idx)):
-            self.joint_pos[i] = self.low_state.motor_state[self.config.joint2motor_idx[i]].q
-            self.joint_vel[i] = self.low_state.motor_state[self.config.joint2motor_idx[i]].dq
+            self.joint_pos[i] = self.low_state.motor_state[
+                self.config.joint2motor_idx[i]
+            ].q
+            self.joint_vel[i] = self.low_state.motor_state[
+                self.config.joint2motor_idx[i]
+            ].dq
 
         quat = self.low_state.imu_state.quaternion
         ang_vel = np.array([self.low_state.imu_state.gyroscope], dtype=np.float32)
@@ -205,16 +241,26 @@ class Controller:
             waist_yaw = self.low_state.motor_state[self.config.torso_idx].q
             waist_yaw_omega = self.low_state.motor_state[self.config.torso_idx].dq
             quat, ang_vel = transform_imu_data(
-                waist_yaw=waist_yaw, waist_yaw_omega=waist_yaw_omega, imu_quat=quat, imu_omega=ang_vel
+                waist_yaw=waist_yaw,
+                waist_yaw_omega=waist_yaw_omega,
+                imu_quat=quat,
+                imu_omega=ang_vel,
             )
 
         gravity_orientation = get_gravity_orientation(quat)
-        joint_pos = (self.joint_pos - self.config.default_joint_pos) * self.config.dof_pos_scale
+        joint_pos = (
+            self.joint_pos - self.config.default_joint_pos
+        ) * self.config.dof_pos_scale
         joint_vel = self.joint_vel * self.config.dof_vel_scale
         ang_vel = ang_vel * self.config.ang_vel_scale
 
         command = np.array(
-            [self.remote_controller.ly, -self.remote_controller.lx, -self.remote_controller.rx], dtype=np.float32
+            [
+                self.remote_controller.ly,
+                -self.remote_controller.lx,
+                -self.remote_controller.rx,
+            ],
+            dtype=np.float32,
         )
         command *= self.config.command_scale
         command = np.clip(command, self.clip_min_command, self.clip_max_command)
@@ -236,12 +282,22 @@ class Controller:
             )
 
         obs = self.current_obs_history.reshape(1, -1).astype(np.float32)
-        self.action = self.policy(torch.from_numpy(obs).clip(-100, 100)).clip(-100, 100).detach().numpy().squeeze()
+        self.action = (
+            self.policy(torch.from_numpy(obs).clip(-100, 100))
+            .clip(-100, 100)
+            .detach()
+            .numpy()
+            .squeeze()
+        )
 
-        target_dof_pos = self.config.default_joint_pos + self.action * self.config.action_scale
+        target_dof_pos = (
+            self.config.default_joint_pos + self.action * self.config.action_scale
+        )
         with self.cmd_lock:
             for i in range(len(self.config.joint2motor_idx)):
-                self.low_cmd.motor_cmd[self.config.joint2motor_idx[i]].q = target_dof_pos[i]
+                self.low_cmd.motor_cmd[self.config.joint2motor_idx[i]].q = (
+                    target_dof_pos[i]
+                )
 
 
 if __name__ == "__main__":
@@ -249,10 +305,21 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--net", type=str, default="eno1", help="network interface")
-    parser.add_argument("--config_path", type=str, default="configs/g1.yaml", help="configuration file path")
+    parser.add_argument(
+        "--config_path",
+        type=str,
+        default="configs/g1/g1.yaml",
+        help="configuration file path",
+    )
+    parser.add_argument(
+        "--depoly_config_path",
+        type=str,
+        default="configs/g1/deploy.yaml",
+        help="deployment configuration file path",
+    )
     args = parser.parse_args()
 
-    config = Config(args.config_path)
+    config = Config(args.config_path, args.depoly_config_path)
     controller = Controller(config, args.net)
 
     try:
