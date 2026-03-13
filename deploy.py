@@ -43,13 +43,14 @@ from common.command_helper import (
 from common.remote_controller import KeyMap, RemoteController
 from common.rotation_helper import get_gravity_orientation, transform_imu_data
 from .config import Config
+from .custom.robot_model_pin import robot_dynamics
 
 
 class Controller:
     def __init__(self, config: Config, net: str) -> None:
 
         ChannelFactoryInitialize(0, net)
-
+        self.running = True
         self.first_run = True
         self.config = config
         self.remote_controller = RemoteController()
@@ -60,14 +61,21 @@ class Controller:
         )  # 100Hz/50Hz
         self.publish_thread = RecurrentThread(interval=1 / 500, target=self.publish)
         self.cmd_lock = Lock()
+        self.state_lock = Lock()
+        self.state_obs_lock = Lock()
 
-        self.joint_pos = np.zeros(config.num_actions, dtype=np.float32)
-        self.joint_vel = np.zeros(config.num_actions, dtype=np.float32)
-        self.action = np.zeros(config.num_actions, dtype=np.float32)
+        # maybe policy action is the part of total action, so we need to prepare the full action array.
+
+        self.joint_pos = np.zeros(config.total_action, dtype=np.float32)
+        self.joint_vel = np.zeros(config.total_action, dtype=np.float32)
+        self.action = np.zeros(config.total_action, dtype=np.float32)
+        self.policy_joint_pos = np.zeros(config.num_actions, dtype=np.float32)
+        self.policy_joint_vel = np.zeros(config.num_actions, dtype=np.float32)
+        self.policy_output = np.zeros(config.num_actions, dtype=np.float32)
 
         self.current_obs = np.zeros(config.num_obs, dtype=np.float32)
         self.current_obs_history = np.zeros(
-            (config.history_length, config.num_obs), dtype=np.float32
+            (config.base_policy_history_len, config.num_obs), dtype=np.float32
         )
 
         self.clip_min_command = np.array(
@@ -91,6 +99,11 @@ class Controller:
             with torch.inference_mode():
                 obs = self.current_obs_history.reshape(1, -1).astype(np.float32)
                 self.policy(torch.from_numpy(obs))
+
+        if self.config.use_sportstate:
+            self.dynamics = robot_dynamics(
+                dynamics_name=self.config.robot_name, urdf_path=self.config.urdf_path
+            )
 
         if config.msg_type == "hg":
             self.low_cmd = unitree_hg_msg_dds__LowCmd_()
@@ -148,14 +161,74 @@ class Controller:
         self.run_thread.Start()
 
     def LowStateHandler(self, msg: LowStateHG):
-        self.low_state = msg
+        with self.state_lock:
+            self.low_state = msg
         self.remote_controller.set(self.low_state.wireless_remote)
 
     def SportStateHandler(self, msg: SportState):
-        self.sport_state = msg
+        with self.state_lock:
+            self.sport_state = msg
+
+    def safe_protect(self, joint_pos):
+        for i in range(len(self.config.joint_threshold)):
+            if (
+                joint_pos[i] < self.config.joint_threshold[i][0]
+                or joint_pos[i] > self.config.joint_threshold[i][1]
+            ):
+                print(f"Joint {i} out of threshold! Joint pos: {joint_pos[i]:.2f}")
+                return True
+        return False
 
     def publish(self):
+        with self.state_lock:
+            q_cache = self.low_state.motor_state.q.copy()
+            dq_cache = self.low_state.motor_state.dq.copy()
+            quat = self.low_state.imu_state.quaternion
+            ang_vel = np.array([self.low_state.imu_state.gyroscope], dtype=np.float32)
+            # 老版imu在躯干，新版本在盆骨
+            if self.config.imu_type == "torso":
+                waist_yaw = self.low_state.motor_state[self.config.torso_idx].q
+                waist_yaw_omega = self.low_state.motor_state[self.config.torso_idx].dq
+                quat, ang_vel = transform_imu_data(
+                    waist_yaw=waist_yaw,
+                    waist_yaw_omega=waist_yaw_omega,
+                    imu_quat=quat,
+                    imu_omega=ang_vel,
+                )
+            if self.config.use_sportstate:
+                base_pos = np.array(self.sport_state.position, dtype=np.float32)
+                base_vel = np.array(self.sport_state.velocity, dtype=np.float32)
+
+        with self.state_obs_lock:
+            for i in range(len(self.config.joint2motor_idx)):
+                self.joint_pos[i] = q_cache[self.config.joint2motor_idx[i]]
+                self.joint_vel[i] = dq_cache[self.config.joint2motor_idx[i]]
+            for i in range(len(self.config.polic_idx)):
+                self.policy_joint_pos[i] = q_cache[self.config.polic_idx[i]]
+                self.policy_joint_vel[i] = dq_cache[self.config.polic_idx[i]]
+
+            self.gravity_orientation = get_gravity_orientation(quat)
+            self.policy_joint_pos = (
+                self.joint_pos - self.config.default_joint_pos
+            ) * self.config.dof_pos_scale
+            self.policy_joint_vel = self.joint_vel * self.config.dof_vel_scale
+            self.policy_ang_vel = ang_vel * self.config.ang_vel_scale
+
+        if self.config.use_sportstate:
+            base_pos = np.concatenate((base_pos, quat), axis=0)
+            base_vel = np.concatenate((base_vel, ang_vel), axis=0)
+            self.dynamics.update_state(
+                base_pos=base_pos,
+                base_vel=base_vel,
+                joint_pos=self.policy_joint_pos,
+                joint_vel=self.policy_joint_vel,
+                dt=self.config.control_dt,
+            )
+            with self.state_obs_lock:
+                pass
         with self.cmd_lock:
+            if not self.running:
+                self.low_cmd = create_damping_cmd(self.low_cmd)
             self.low_cmd.crc = CRC().Crc(self.low_cmd)
             self.lowcmd_publisher_.Write(self.low_cmd)
 
@@ -226,78 +299,57 @@ class Controller:
             time.sleep(self.config.control_dt)
 
     def run(self):
-        for i in range(len(self.config.joint2motor_idx)):
-            self.joint_pos[i] = self.low_state.motor_state[
-                self.config.joint2motor_idx[i]
-            ].q
-            self.joint_vel[i] = self.low_state.motor_state[
-                self.config.joint2motor_idx[i]
-            ].dq
-
-        quat = self.low_state.imu_state.quaternion
-        ang_vel = np.array([self.low_state.imu_state.gyroscope], dtype=np.float32)
-
-        if self.config.imu_type == "torso":
-            waist_yaw = self.low_state.motor_state[self.config.torso_idx].q
-            waist_yaw_omega = self.low_state.motor_state[self.config.torso_idx].dq
-            quat, ang_vel = transform_imu_data(
-                waist_yaw=waist_yaw,
-                waist_yaw_omega=waist_yaw_omega,
-                imu_quat=quat,
-                imu_omega=ang_vel,
+        if self.running:
+            command = np.array(
+                [
+                    self.remote_controller.ly,
+                    -self.remote_controller.lx,
+                    -self.remote_controller.rx,
+                ],
+                dtype=np.float32,
             )
+            command *= self.config.command_scale
+            command = np.clip(command, self.clip_min_command, self.clip_max_command)
 
-        gravity_orientation = get_gravity_orientation(quat)
-        joint_pos = (
-            self.joint_pos - self.config.default_joint_pos
-        ) * self.config.dof_pos_scale
-        joint_vel = self.joint_vel * self.config.dof_vel_scale
-        ang_vel = ang_vel * self.config.ang_vel_scale
-
-        command = np.array(
-            [
-                self.remote_controller.ly,
-                -self.remote_controller.lx,
-                -self.remote_controller.rx,
-            ],
-            dtype=np.float32,
-        )
-        command *= self.config.command_scale
-        command = np.clip(command, self.clip_min_command, self.clip_max_command)
-
-        num_actions = self.config.num_actions
-        self.current_obs[:3] = ang_vel
-        self.current_obs[3:6] = gravity_orientation
-        self.current_obs[6:9] = command
-        self.current_obs[9 : 9 + num_actions] = joint_pos
-        self.current_obs[9 + num_actions : 9 + num_actions * 2] = joint_vel
-        self.current_obs[9 + num_actions * 2 : 9 + num_actions * 3] = self.action
-
-        if self.first_run:
-            self.current_obs_history[:] = self.current_obs.reshape(1, -1)
-            self.first_run = False
-        else:
-            self.current_obs_history = np.concatenate(
-                (self.current_obs_history[1:], self.current_obs.reshape(1, -1)), axis=0
-            )
-
-        obs = self.current_obs_history.reshape(1, -1).astype(np.float32)
-        self.action = (
-            self.policy(torch.from_numpy(obs).clip(-100, 100))
-            .clip(-100, 100)
-            .detach()
-            .numpy()
-            .squeeze()
-        )
-
-        target_dof_pos = (
-            self.config.default_joint_pos + self.action * self.config.action_scale
-        )
-        with self.cmd_lock:
-            for i in range(len(self.config.joint2motor_idx)):
-                self.low_cmd.motor_cmd[self.config.joint2motor_idx[i]].q = (
-                    target_dof_pos[i]
+            num_actions = self.config.num_actions
+            with self.state_obs_lock:
+                self.current_obs[:3] = self.policy_ang_vel
+                self.current_obs[3:6] = self.gravity_orientation
+                self.current_obs[6:9] = command
+                self.current_obs[9 : 9 + num_actions] = self.policy_joint_pos
+                self.current_obs[9 + num_actions : 9 + num_actions * 2] = (
+                    self.policy_joint_vel
                 )
+                self.current_obs[9 + num_actions * 2 : 9 + num_actions * 3] = (
+                    self.policy_output
+                )
+
+            if self.first_run:
+                self.current_obs_history[:] = self.current_obs.reshape(1, -1)
+                self.first_run = False
+            else:
+                self.current_obs_history = np.concatenate(
+                    (self.current_obs_history[1:], self.current_obs.reshape(1, -1)),
+                    axis=0,
+                )
+
+            obs = self.current_obs_history.reshape(1, -1).astype(np.float32)
+            self.action = (
+                self.policy(torch.from_numpy(obs).clip(-100, 100))
+                .clip(-100, 100)
+                .detach()
+                .numpy()
+                .squeeze()
+            )
+
+            target_dof_pos = (
+                self.config.default_joint_pos + self.action * self.config.action_scale
+            )
+            with self.cmd_lock:
+                for i in range(len(self.config.joint2motor_idx)):
+                    self.low_cmd.motor_cmd[self.config.joint2motor_idx[i]].q = (
+                        target_dof_pos[i]
+                    )
 
 
 if __name__ == "__main__":

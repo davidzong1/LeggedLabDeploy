@@ -2,12 +2,17 @@ control_dt: 0.02
 robot_name: "g1"
 msg_type: "hg"     # "hg" or "go"
 imu_type: "pelvis"    # "torso" or "pelvis"
-
+use_sportstate: true
 lowcmd_topic: "rt/lowcmd"
 lowstate_topic: "rt/lowstate"
 sportstate_topic: "rt/odommodestate"
 policy_path: "policy/g1/policy.pt"
-history_length: 1
+
+urdf_path: "../source/labDynamics/model/unitree_description/urdf/g1/black_ass_g1_lock_hand_wait.urdf"
+history_length: 
+{
+  observations: 5
+}
 total_action: 29
 joint2motor_idx: [0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10, 16, 23, 5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28]
 policy_action_ids: [0, 6, 12, 1, 7, 2, 8, 3, 9, 15, 22, 4, 10, 16, 23, 5, 11, 17, 24, 18, 25 ]
@@ -16,3 +21,32 @@ KD:  [2.56, 6.31, 2.56, 6.31, 1.81, 1.81, 1.81, 1.81, 2.56, 6.31, 2.56, 6.31, 1.
 kps:                 [200, 200, 200, 150, 150, 200, 150, 150, 200, 200, 200, 100, 100, 20, 20, 100, 100, 20, 20, 50, 50, 50, 50, 40, 40, 40, 40, 40, 40]
 kds:                 [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
 command_range: {lin_vel_x: [-0.4, 0.7], lin_vel_y: [-0.4, 0.4], ang_vel_z: [-1.57, 1.57]}
+joint_threshold: {
+    "left_hip_pitch":[-1.5, 1.5],   
+    "left_hip_roll":[-0.52, 1.0], 
+    "left_hip_yaw":[-0.4, 0.4],
+    "left_knee":[-0.0, 2], 
+    "left_ankle_pitch":[-0.875, 0.5236],
+    "left_ankle_roll":[-0.2618, 0.2618],
+    "right_hip_pitch":[-1.5, 1.5],
+    "right_hip_roll":[-0.52, 1.0],
+    "right_hip_yaw":[-0.4, 0.4],
+    "right_knee":[-0.0, 2],
+    "right_ankle_pitch":[-0.875, 0.5236],
+    "right_ankle_roll":[-0.2618, 0.2618],
+    "waist_yaw":[-2.618, 2.618],
+    "left_shoulder_pitch":[-3.0892,2.6704],
+    "left_shoulder_roll":[-1.5882,2.2512],
+    "left_shoulder_yaw":[-100,100],
+    "left_elbow":[-1.0472,2.0944],
+    "left_wrist_roll":[-100,100],
+    "left_wrist_pitch":[-100,100],
+    "left_wrist_yaw":[-100,100],
+    "right_shoulder_pitch":[-3.0892,2.6704],
+    "right_shoulder_roll":[-1.5882,2.2512],
+    "right_shoulder_yaw":[-100,100],
+    "right_elbow":[-1.0472,2.0944],
+    "right_wrist_roll":[-100,100],
+    "right_wrist_pitch":[-100,100],
+    "right_wrist_yaw":[-100,100]
+}

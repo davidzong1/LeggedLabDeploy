@@ -28,6 +28,12 @@ class Config:
             self.weak_motor = []
             if "weak_motor" in config:
                 self.weak_motor = config["weak_motor"]
+            if "use_sportstate" in config:
+                self.use_sportstate = config["use_sportstate"]
+                self.urdf_path = config["urdf_path"]
+            else:
+                self.use_sportstate = False
+                self.urdf_path = None
 
             self.lowcmd_topic = config["lowcmd_topic"]
             self.lowstate_topic = config["lowstate_topic"]
@@ -35,6 +41,10 @@ class Config:
             self.policy_path = config["policy_path"]
             self.total_action = config["total_action"]
             self.command_range = config["command_range"]
+            joint_threshold_cache: dict = config["joint_threshold"]
+            self.joint_threshold = []
+            for key, value in joint_threshold_cache.items():
+                self.joint_threshold.append(np.array(value, dtype=np.float32))
 
         # load policy depoly configuration
         with open(depoly_config_path) as f:
@@ -49,3 +59,11 @@ class Config:
             if self.robot_name == "g1":
                 self.policy_obs = config["observation"]
                 self.action_scale = config["actions"]["scale"]
+
+            self.base_policy_history_len = config["observations"]["projected_gravity"][
+                "history_length"
+            ]
+            self.num_obs = 0
+            for k, v in config["observations"].items():
+                self.num_obs += len(v["scale"])
+            self.num_actions = len(config["actions"]["scale"])
